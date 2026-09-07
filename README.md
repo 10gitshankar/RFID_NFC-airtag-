@@ -32,14 +32,16 @@ This project automates gate entry and exit for a parking/access system by readin
 
 
 ## How It Works
-# 1. Entry Flow
+1. Entry Flow
+
+
 VEHICLE ARRIVES
       |
-      v
-+------------------------+
+      
+------------------------
 | Entry Terminal         |
 | RFID Reader            |
-+------------------------+
+------------------------+
       |
   Card detected
       |
