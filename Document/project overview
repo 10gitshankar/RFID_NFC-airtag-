@@ -1,1 +1,9 @@
+Automatic Gate Opening using RFID & NFC (ESP32)
 
+An ESP32-based automatic gate/parking access control system using RFID (RC522) card 
+detection for member and visitor vehicle management — inspired by real mall/parking entry-exit workflows.
+
+Overview
+This project automates gate entry and exit for a parking/access system by reading RFID/NFC cards, 
+checking membership status against a database, and triggering a relay-controlled gate. 
+It supports both registered members and walk-in visitors, with separate logic paths for each.
