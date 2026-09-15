@@ -32,11 +32,11 @@ This project automates gate entry and exit for a parking/access system by readin
 
 
 ## How It Works
-1. Entry Flow
+   1. Entry Flow
 
 
-VEHICLE ARRIVES
-      |
+   VEHICLE ARRIVES
+          |
       
 ------------------------
 | Entry Terminal         |
@@ -65,7 +65,7 @@ validity/status                temporary ID
 OPEN GATE   DENY
 
 
- # 2.Exit-flow
+2.Exit-flow
 
 Vehicle arrives at EXIT
         |
@@ -94,7 +94,7 @@ DISCOUNT     REQUIRED
         v
 Close parking session
 
-# Production-Grade Architecture (Target Design)
+Production-Grade Architecture (Target Design)
 MEMBER CARD
     |
     v
