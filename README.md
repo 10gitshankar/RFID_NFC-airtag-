@@ -96,16 +96,16 @@ Close parking session
 
 Production-Grade Architecture (Target Design)
 MEMBER CARD
-    |
-    v
+           |
+           v
 +--------------------------+
 | Secure RFID Reader       |
 | 13.56 MHz                |
 +--------------------------+
-    |
-  SPI/UART
-    |
-    v
+           |
+       SPI/UART
+           |
+           v
 +--------------------------+
 |        ESP32-S3          |
 |  Authenticate card       |
@@ -114,15 +114,15 @@ MEMBER CARD
 |  Anti-passback           |
 |  Log access              |
 +--------------------------+
-    |
- VALID / INVALID
-    |
+            |
+      VALID / INVALID
+            |
     -------------------
-    |                 |
-Gate controller   Alarm/display
-    |
-    v
- OPEN/CLOSE
+   |                 |
+ Gate controller   Alarm/display
+            |
+            v
+       OPEN/CLOSE
 
 ## Hardware
 ESP32-S3 microcontroller
