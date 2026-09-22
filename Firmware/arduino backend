@@ -1,0 +1,464 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <Wire.h>
+#include <PN532_I2C.h>
+#include <PN532.h>
+
+// ================= 1. Network & API Configurations =================
+const char* WIFI_SSID       = "wifi_ssid";
+const char* WIFI_PASSWORD   = "password";
+
+// API Endpoints (Trailing slashes are strictly required!)
+const char* API_BASE_URL    = "https://centralmall.wheelstrulyyours.com.np/api/membership";
+const char* GATE_KEY        = "kkajsdfi3r959834ytkjadsnfj32"; // -char Hex Key
+const char* GATE_TYPE       = "ENTRY";                            // "ENTRY" or "EXIT"
+
+// ================= 2. Hardware Pin Configurations =================
+#define I2C_SDA_PIN         42    // PN532 SDA
+#define I2C_SCL_PIN         2     // PN532 SCL
+#define BUZZER_PIN          39    // Active Buzzer
+#define RELAY_PIN           40    // Relay Trigger (COM, NO, NC)
+
+// ================= 3. Timing Configurations =================
+#define HTTP_TIMEOUT_MS     5000  // 5 seconds timeout before offline fallback
+#define PASSING_TIME_SEC    20    // 20 seconds car passing window
+#define SYNC_INTERVAL_MS    (10UL * 60UL * 1000UL) // Sync cards every 10 minutes
+
+// File paths on ESP32 Flash (LittleFS)
+const char* CARDS_FILE      = "/cards.json";
+const char* CARDS_NEW_FILE  = "/cards.new";
+const char* QUEUE_FILE      = "/queue.json";
+
+// Global Objects & States
+PN532_I2C pn532_i2c(Wire);
+PN532 nfc(pn532_i2c);
+
+unsigned long lastSyncMillis = 0;
+String lastServerTimestamp   = "";
+
+// ================= 4. Hardware Helper Functions =================
+
+// Relay Logic:
+// HIGH: COM connects to NO (Gate Open Pulse/Signal)
+// LOW : COM connects to NC (Gate Close Signal)
+void setRelayOpen() {
+  digitalWrite(RELAY_PIN, HIGH);
+}
+
+void setRelayClose() {
+  digitalWrite(RELAY_PIN, LOW);
+}
+
+// Buzzer Pattern Generator
+void beepBuzzer(int times, int onDurationMs, int offDurationMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(onDurationMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < times - 1) delay(offDurationMs);
+  }
+}
+
+// Convert Scanned UID to 2-character Uppercase Hex (Doc Section 6)
+String uidToHex(const uint8_t* uid, uint8_t size) {
+  String out = "";
+  char buf[3];
+  for (uint8_t i = 0; i < size; i++) {
+    snprintf(buf, sizeof(buf), "%02X", uid[i]);
+    out += buf;
+  }
+  return out;
+}
+
+// ================= 5. LittleFS Storage Helpers =================
+
+void initStorage() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[✕] LittleFS Mount Failed!");
+  } else {
+    Serial.println("[✓] LittleFS Mounted Successfully.");
+  }
+}
+
+// Store an offline tap event in LittleFS queue
+void queueOfflineTap(const String& uid, const String& status) {
+  JsonDocument queueDoc;
+  if (LittleFS.exists(QUEUE_FILE)) {
+    File f = LittleFS.open(QUEUE_FILE, "r");
+    if (f) {
+      deserializeJson(queueDoc, f);
+      f.close();
+    }
+  }
+
+  JsonArray logs = queueDoc["logs"].to<JsonArray>();
+  JsonObject entry = logs.add<JsonObject>();
+  entry["card_uid"]    = uid;
+  entry["gate_type"]   = GATE_TYPE;
+  entry["status"]      = status;
+  entry["tap_millis"]  = millis();
+  entry["reason"]      = "offline tap";
+
+  File f = LittleFS.open(QUEUE_FILE, "w");
+  if (f) {
+    serializeJson(queueDoc, f);
+    f.close();
+    Serial.println("[✓] Offline tap saved to queue.");
+  }
+}
+
+// ================= 6. Network & API Handlers =================
+
+bool isWiFiConnected() {
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+void connectWiFi() {
+  if (isWiFiConnected()) return;
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (isWiFiConnected()) {
+    Serial.println("\n[✓] Wi-Fi Connected! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[!] Wi-Fi Unavailable. Operating in Offline Fallback Mode.");
+  }
+}
+
+// Download Active Cards from Server (Doc Section 4 & 9.3)
+bool refreshActiveCards() {
+  if (!isWiFiConnected()) return false;
+
+  Serial.println("[*] Downloading active cards from server...");
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  String url = String(API_BASE_URL) + "/active-cards/";
+
+  if (!http.begin(client, url)) return false;
+  http.addHeader("X-Gate-Key", GATE_KEY);
+
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    Serial.printf("[✕] Download Failed, HTTP: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+
+  // Stream directly to temporary file
+  File tempFile = LittleFS.open(CARDS_NEW_FILE, "w");
+  if (!tempFile) {
+    http.end();
+    return false;
+  }
+  http.writeToStream(&tempFile);
+  tempFile.close();
+  http.end();
+
+  // Atomically replace old file
+  LittleFS.remove(CARDS_FILE);
+  LittleFS.rename(CARDS_NEW_FILE, CARDS_FILE);
+  Serial.println("[✓] Card list updated successfully in Flash.");
+  return true;
+}
+
+// Upload Queued Offline Logs (Doc Section 5 & 8.3)
+bool uploadOfflineQueue() {
+  if (!isWiFiConnected() || !LittleFS.exists(QUEUE_FILE)) return true;
+
+  File f = LittleFS.open(QUEUE_FILE, "r");
+  if (!f) return true;
+
+  JsonDocument queueDoc;
+  DeserializationError err = deserializeJson(queueDoc, f);
+  f.close();
+  if (err) return false;
+
+  JsonArray logsArray = queueDoc["logs"].as<JsonArray>();
+  if (logsArray.size() == 0) return true;
+
+  Serial.printf("[*] Uploading %d offline tap records...\n", logsArray.size());
+
+  // Prepare Payload with seconds_ago
+  JsonDocument uploadDoc;
+  JsonArray logsToSend = uploadDoc["logs"].to<JsonArray>();
+  uint32_t now = millis();
+
+  for (JsonObject item : logsArray) {
+    JsonObject log = logsToSend.add<JsonObject>();
+    log["card_uid"]    = item["card_uid"];
+    log["gate_type"]   = item["gate_type"];
+    log["status"]      = item["status"];
+    log["seconds_ago"] = (now - item["tap_millis"].as<uint32_t>()) / 1000;
+    log["reason"]      = "offline tap";
+  }
+
+  String payload;
+  serializeJson(uploadDoc, payload);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  String url = String(API_BASE_URL) + "/sync-offline-logs/";
+
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Gate-Key", GATE_KEY);
+
+  int httpCode = http.POST(payload);
+  http.end();
+
+  if (httpCode == 200) {
+    Serial.println("[✓] Offline logs successfully synced to server!");
+    LittleFS.remove(QUEUE_FILE); // Delete queue only after HTTP 200
+    refreshActiveCards();        // Refresh list to update state
+    return true;
+  }
+  return false;
+}
+
+// ================= 7. Decision Engines =================
+
+// Online Verification (Doc Section 3)
+// Returns: 1 = Granted, 0 = Denied, -1 = Network/Server Fallback
+int verifyCardOnline(const String& uid, String& outMsg) {
+  if (!isWiFiConnected()) return -1;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  String url = String(API_BASE_URL) + "/gate-access/";
+  if (!http.begin(client, url)) return -1;
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Gate-Key", GATE_KEY);
+
+  String payload = "{\"card_uid\":\"" + uid + "\",\"gate_type\":\"" + GATE_TYPE + "\"}";
+  int httpCode = http.POST(payload);
+
+  if (httpCode <= 0 || httpCode >= 500) {
+    http.end();
+    return -1; // Fallback to offline on timeout or 5xx
+  }
+
+  String response = http.getString();
+  http.end();
+
+  if (httpCode == 400 || httpCode == 403) {
+    outMsg = "Key/Request Error (" + String(httpCode) + ")";
+    return 0; // Strict denial
+  }
+
+  if (httpCode == 200) {
+    JsonDocument doc;
+    if (deserializeJson(doc, response)) return -1;
+    bool open = doc["open_barrier"] | false;
+    outMsg = doc["message"] | "";
+    return open ? 1 : 0;
+  }
+
+  return -1;
+}
+
+// Offline Verification (Doc Section 7.2, 8.1, 8.5)
+bool verifyCardOffline(const String& uid, String& outStatus) {
+  if (!LittleFS.exists(CARDS_FILE)) {
+    outStatus = "DENIED_INVALID_CARD";
+    return false;
+  }
+
+  File f = LittleFS.open(CARDS_FILE, "r");
+  if (!f) {
+    outStatus = "DENIED_INVALID_CARD";
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    outStatus = "DENIED_INVALID_CARD";
+    return false;
+  }
+
+  JsonArray cards = doc["cards"].as<JsonArray>();
+  for (JsonObject card : cards) {
+    String cardUid = card["card_uid"] | "";
+    bool match = (cardUid.equalsIgnoreCase(uid));
+
+    if (!match && card.containsKey("card_variants")) {
+      for (JsonVariant v : card["card_variants"].as<JsonArray>()) {
+        if (uid.equalsIgnoreCase(v.as<const char*>())) {
+          match = true;
+          break;
+        }
+      }
+    }
+
+    if (match) {
+      // Offline rule: Anti-passback is ignored offline (Doc Section 8.5)
+      outStatus = "GRANTED";
+      return true;
+    }
+  }
+
+  outStatus = "DENIED_INVALID_CARD";
+  return false;
+}
+
+// ================= 8. Barrier Control Sequence =================
+
+// Execute Gate Cycle on Valid Card
+void executeGateOpenSequence() {
+  Serial.println("\n[✓] ACCESS GRANTED!");
+
+  // १. Valid Card: २ पटक बीप (Beep-Beep)
+  beepBuzzer(2, 100, 100);
+
+  // २. Gate Open Signal: Relay ON (COM connects to NO)
+  Serial.println(">>> Opening Barrier: Relay switched to NO.");
+  setRelayOpen();
+
+  // ३. Car Passing Time: २० सेकेन्ड खुला राख्ने र प्रति सेकेन्ड १ पटक बीप
+  Serial.printf(">>> Gate holding open for %d seconds (Passing Interval)...\n", PASSING_TIME_SEC);
+  for (int sec = 1; sec <= PASSING_TIME_SEC; sec++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(500);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(500);
+    yield(); // Keep background network alive
+  }
+
+  // ४. Close Signal: Relay OFF (COM connects to NC)
+  Serial.println(">>> Car Passed. Sending Close Signal via NC port.");
+  setRelayClose();
+
+  Serial.println("[✓] Barrier Cycle Completed. Ready for next card.\n");
+}
+
+// Execute Alert on Denied Card
+void executeAccessDeniedSequence(const String& reason) {
+  Serial.println("\n[✕] ACCESS DENIED: " + reason);
+  // Invalid Card: ३ पटक छिटो-छिटो बीप (Beep-Beep-Beep)
+  beepBuzzer(3, 100, 100);
+  setRelayClose(); // Ensure NC remains idle
+}
+
+// ================= 9. Main Setup & Loop =================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n==================================================");
+  Serial.println("   Goodwish Smart Parking - Gate Controller       ");
+  Serial.println("   Mode: Online + Offline LittleFS Fallback       ");
+  Serial.println("==================================================");
+
+  // Pin Configurations
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  setRelayClose(); // Default idle state (COM connects to NC)
+
+  // Initialize LittleFS Flash Storage
+  initStorage();
+
+  // Connect to Wi-Fi
+  connectWiFi();
+
+  // Sync Cards on Boot if connected
+  if (isWiFiConnected()) {
+    uploadOfflineQueue();
+    refreshActiveCards();
+  }
+
+  // Initialize PN532 via I2C
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  nfc.begin();
+  if (!nfc.getFirmwareVersion()) {
+    Serial.println("[✕] PN532 RFID Reader not detected! Check SDA/SCL wiring.");
+    while (1) {
+      beepBuzzer(1, 100, 900);
+    }
+  }
+
+  nfc.setPassiveActivationRetries(0x30); // Fast scan timeout
+  nfc.SAMConfig();
+
+  Serial.println("[✓] System Ready. Waiting for card tap...\n");
+}
+
+void loop() {
+  // Background Sync Routine (Every 10 mins or on Wi-Fi reconnect)
+  if (isWiFiConnected()) {
+    if (millis() - lastSyncMillis > SYNC_INTERVAL_MS) {
+      lastSyncMillis = millis();
+      uploadOfflineQueue();
+      refreshActiveCards();
+    }
+  } else {
+    // Periodically retry Wi-Fi connection
+    if (millis() - lastSyncMillis > 30000) {
+      lastSyncMillis = millis();
+      connectWiFi();
+    }
+  }
+
+  uint8_t uid[7];
+  uint8_t uidLength;
+
+  // Scan RFID Card (300ms timeout)
+  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 300)) {
+    String cardUID = uidToHex(uid, uidLength);
+    Serial.println("--------------------------------------------------");
+    Serial.println("[+] Card Scanned! Normalized UID: " + cardUID);
+
+    String message = "";
+    int onlineResult = verifyCardOnline(cardUID, message);
+
+    if (onlineResult == 1) {
+      // 1. Online Granted
+      executeGateOpenSequence();
+    } 
+    else if (onlineResult == 0) {
+      // 2. Online Denied (Anti-passback, Invalid, Expired)
+      executeAccessDeniedSequence(message);
+    } 
+    else {
+      // 3. Offline Fallback (No Internet / Server Unreachable)
+      Serial.println("[!] Server unreachable. Checking local Flash database...");
+      String offlineStatus = "";
+      bool offlineGranted = verifyCardOffline(cardUID, offlineStatus);
+
+      // Record offline decision to flash queue
+      queueOfflineTap(cardUID, offlineStatus);
+
+      if (offlineGranted) {
+        Serial.println("[✓] Card Valid in Offline Database.");
+        executeGateOpenSequence();
+      } else {
+        executeAccessDeniedSequence("Card not found in offline list");
+      }
+    }
+
+    // Cooldown to prevent multi-tapping
+    delay(2000);
+    Serial.println("Ready for next card...\n");
+  }
+}
